@@ -1,0 +1,5 @@
+aiortc>=1.9
+aiohttp>=3.9
+mss>=9
+numpy>=1.26
+pynput>=1.7

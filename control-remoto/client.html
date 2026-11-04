@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Control remoto</title>
+<style>
+  :root { --bg:#0f1115; --panel:#1a1d24; --text:#e8eaf0; --muted:#9aa1b0; --accent:#4f8cff; --err:#ff6b6b; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #login { display:flex; align-items:center; justify-content:center; height:100%; padding:16px; }
+  #login form { background:var(--panel); padding:28px; border-radius:12px; width:100%; max-width:360px; }
+  h1 { font-size:20px; margin:0 0 6px; }
+  p.sub { color:var(--muted); margin:0 0 20px; font-size:14px; }
+  input[type=password] { width:100%; padding:12px; border-radius:8px; border:1px solid #333a48;
+    background:#11141a; color:var(--text); font-size:16px; }
+  button { padding:10px 14px; border:0; border-radius:8px; background:var(--accent); color:#fff;
+    font-size:14px; cursor:pointer; }
+  button.ghost { background:#2a2f3a; }
+  #login button { width:100%; margin-top:12px; padding:12px; font-size:16px; }
+  #msg { color:var(--err); min-height:20px; margin-top:10px; font-size:14px; }
+  #session { display:none; height:100%; flex-direction:column; }
+  #bar { display:flex; gap:8px; align-items:center; padding:6px 8px; background:var(--panel);
+    flex-wrap:wrap; }
+  #status { color:var(--muted); font-size:13px; margin-right:auto; }
+  #stage { flex:1; position:relative; overflow:hidden; outline:none; }
+  video { width:100%; height:100%; object-fit:contain; background:#000; display:block;
+    cursor:default; touch-action:none; }
+  #kbd { position:absolute; opacity:0; width:1px; height:1px; left:-10px; }
+  body.full #bar { display:none; }
+</style>
+</head>
+<body>
+<div id="login">
+  <form id="form">
+    <h1>Control remoto</h1>
+    <p class="sub">Escribe la contraseña que muestra el programa en tu PC.</p>
+    <input id="pw" type="password" autocomplete="current-password" placeholder="Contraseña" required autofocus>
+    <button type="submit">Conectar</button>
+    <div id="msg"></div>
+  </form>
+</div>
+
+<div id="session">
+  <div id="bar">
+    <span id="status">Conectando…</span>
+    <button class="ghost" id="btnKbd" title="Teclado en pantalla (móvil)">⌨</button>
+    <button class="ghost" id="btnPaste" title="Escribir el texto del portapapeles en la PC">Pegar texto</button>
+    <button class="ghost" id="btnFull">Pantalla completa</button>
+    <button id="btnOut">Desconectar</button>
+  </div>
+  <div id="stage" tabindex="0">
+    <video id="video" autoplay playsinline muted></video>
+    <input id="kbd" autocomplete="off" autocapitalize="off" autocorrect="off">
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), stage = $('stage');
+let pc = null, dc = null, viewOnly = false;
+
+function send(obj) { if (dc && dc.readyState === 'open' && !viewOnly) dc.send(JSON.stringify(obj)); }
+function setStatus(t) { $('status').textContent = t; }
+
+$('form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const btn = e.submitter || $('form').querySelector('button');
+  if (btn.disabled) return;
+  btn.disabled = true; btn.textContent = 'Conectando…';
+  $('msg').textContent = '';
+  try { await connect($('pw').value); }
+  catch (err) { disconnect(false); $('msg').textContent = err.message; }
+  finally { btn.disabled = false; btn.textContent = 'Conectar'; }
+});
+
+async function connect(password) {
+  pc = new RTCPeerConnection();
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  dc = pc.createDataChannel('input', { ordered: true });
+  dc.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.t === 'info') { viewOnly = m.viewOnly; setStatus(viewOnly ? 'Conectado (solo ver)' : 'Conectado'); }
+  };
+  pc.ontrack = ev => { video.srcObject = ev.streams[0] || new MediaStream([ev.track]); };
+  pc.onconnectionstatechange = () => {
+    const s = pc && pc.connectionState;
+    if (s === 'failed' || s === 'disconnected') setStatus('Conexión perdida');
+    if (s === 'failed') disconnect(true, 'La conexión falló.');
+  };
+
+  await pc.setLocalDescription(await pc.createOffer());
+  // Esperar a reunir candidatos ICE (el host no usa trickle ICE).
+  await new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    const t = setTimeout(res, 3000);
+    pc.addEventListener('icegatheringstatechange', () => {
+      if (pc.iceGatheringState === 'complete') { clearTimeout(t); res(); }
+    });
+  });
+
+  const r = await fetch('offer', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type, password }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ('Error ' + r.status));
+  await pc.setRemoteDescription(data);
+
+  $('pw').value = '';
+  $('login').style.display = 'none';
+  $('session').style.display = 'flex';
+  stage.focus();
+}
+
+function disconnect(showLogin = true, msg = '') {
+  send({ t: 'release-all' });
+  if (dc) try { dc.close(); } catch {}
+  if (pc) try { pc.close(); } catch {}
+  pc = dc = null;
+  video.srcObject = null;
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  if (showLogin) {
+    $('session').style.display = 'none';
+    $('login').style.display = 'flex';
+    $('msg').textContent = msg;
+  }
+}
+$('btnOut').onclick = () => disconnect(true);
+
+// ---------- Coordenadas: del video mostrado (con bandas negras) a 0..1 ----------
+function norm(ev) {
+  const r = video.getBoundingClientRect();
+  const vw = video.videoWidth || r.width, vh = video.videoHeight || r.height;
+  const scale = Math.min(r.width / vw, r.height / vh);
+  const w = vw * scale, h = vh * scale;
+  const ox = r.left + (r.width - w) / 2, oy = r.top + (r.height - h) / 2;
+  return {
+    x: Math.min(Math.max((ev.clientX - ox) / w, 0), 1),
+    y: Math.min(Math.max((ev.clientY - oy) / h, 0), 1),
+  };
+}
+
+// ---------- Mouse / táctil ----------
+let pendingMove = null;
+video.addEventListener('pointermove', ev => {
+  // Agrupa movimientos por cuadro de animación para no saturar el canal.
+  if (!pendingMove) requestAnimationFrame(() => { send({ t: 'move', ...pendingMove }); pendingMove = null; });
+  pendingMove = norm(ev);
+});
+video.addEventListener('pointerdown', ev => {
+  ev.preventDefault();
+  stage.focus();
+  video.setPointerCapture(ev.pointerId);
+  send({ t: 'down', b: ev.button, ...norm(ev) });
+});
+video.addEventListener('pointerup', ev => { ev.preventDefault(); send({ t: 'up', b: ev.button, ...norm(ev) }); });
+video.addEventListener('contextmenu', ev => ev.preventDefault());
+video.addEventListener('wheel', ev => {
+  ev.preventDefault();
+  const k = ev.deltaMode === 1 ? 40 : ev.deltaMode === 2 ? 800 : 1;
+  send({ t: 'wheel', dx: ev.deltaX * k, dy: ev.deltaY * k });
+}, { passive: false });
+
+// ---------- Teclado ----------
+function onKey(ev, down) {
+  if (ev.target === $('kbd') && ev.key === 'Unidentified') return; // teclados móviles: se maneja en 'input'
+  if (ev.isComposing) return;
+  ev.preventDefault();
+  send({ t: down ? 'kd' : 'ku', key: ev.key, code: ev.code });
+}
+stage.addEventListener('keydown', ev => onKey(ev, true));
+stage.addEventListener('keyup', ev => onKey(ev, false));
+// Al perder el foco, soltar todo para que no queden teclas pegadas.
+window.addEventListener('blur', () => send({ t: 'release-all' }));
+
+// Teclado en pantalla para móviles
+$('btnKbd').onclick = () => $('kbd').focus();
+$('kbd').addEventListener('input', ev => {
+  const v = ev.target.value;
+  if (v) send({ t: 'type', text: v });
+  ev.target.value = '';
+});
+
+$('btnPaste').onclick = async () => {
+  let text = '';
+  try { text = await navigator.clipboard.readText(); } catch {}
+  if (!text) text = prompt('Texto para escribir en la PC:') || '';
+  if (text) send({ t: 'type', text });
+  stage.focus();
+};
+
+$('btnFull').onclick = async () => {
+  try {
+    await document.documentElement.requestFullscreen();
+    document.body.classList.add('full');
+    // Bloquear teclas como Esc/Win cuando el navegador lo permite (Chrome).
+    if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(() => {});
+  } catch {}
+  stage.focus();
+};
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement) document.body.classList.remove('full');
+});
+</script>
+</body>
+</html>
